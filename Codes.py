@@ -9,6 +9,9 @@ import itertools
 import scipy.linalg
 
 
+class Code():
+    pass
+
 class ToricCode:
     '''
     From https://github.com/Krastanov/neural-decoder/

@@ -7,6 +7,7 @@ import argparse
 import random
 import os
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from torch.utils import data
 from datetime import datetime
 import logging
@@ -134,16 +135,25 @@ def diff_GF2_mul(H,x):
 def train(model, device, train_loader, optimizer, epoch, LR):
     model.train()
     cum_loss = cum_ber = cum_ler = cum_samples = 0
-    cum_loss1 = cum_loss2 = cum_loss3 = 0
+    cum_loss1 = cum_loss2 = cum_loss3 = cum_loss_ssl= 0
     t = time.time()
     # bin_fun = binarization
     bin_fun = torch.sigmoid
     for batch_idx, (x, z, y, magnitude, syndrome) in enumerate(train_loader):
         syndrome = syndrome.to(device)
-        z_pred = model(magnitude.to(device), syndrome)
-        loss1,loss2 = model.module.loss(-z_pred, z.to(device))
-        loss3 = torch.nn.functional.binary_cross_entropy_with_logits((diff_GF2_mul(train_loader.dataset.logic_matrix,bin_fun(-z_pred))),logical_flipped(train_loader.dataset.logic_matrix, z.to(device)))
-        loss = args.lambda_loss_ber*loss1+args.lambda_loss_n_pred*loss2+args.lambda_loss_ler*loss3
+        z_pred, z_layers_pred = model(magnitude.to(device), syndrome)
+        loss1,loss2, loss_ssl = model.module.loss(-z_pred, z.to(device), z_layers_pred)
+        #loss3 = 0.0
+        # loss4 = 0.0
+        # w = 0.05
+        # for z_inter in z_layers_pred:
+        #     loss3 += w *F.binary_cross_entropy_with_logits(
+        #         (diff_GF2_mul(train_loader.dataset.logic_matrix, bin_fun(-z_inter))),
+        #         logical_flipped(train_loader.dataset.logic_matrix, z.to(device)))
+        #     w += 0.05
+        loss3 = F.binary_cross_entropy_with_logits((diff_GF2_mul(train_loader.dataset.logic_matrix,bin_fun(-z_pred))),logical_flipped(train_loader.dataset.logic_matrix, z.to(device)))
+        ler_weight = min(1.0, epoch / 30)
+        loss = args.lambda_loss_ber*loss1/args.N_dec +args.lambda_loss_n_pred*loss2+args.lambda_loss_ler*loss3 + args.lambda_loss_ler*loss_ssl/ args.N_dec
         model.zero_grad()
         loss.backward()
         optimizer.step()
@@ -157,6 +167,7 @@ def train(model, device, train_loader, optimizer, epoch, LR):
         cum_loss1 += loss1.item() * z.shape[0]
         cum_loss2 += loss2.item() * z.shape[0]
         cum_loss3 += loss3.item() * z.shape[0]
+        cum_loss_ssl += loss_ssl.item() * z.shape[0]
         #
         cum_ber += ber * z.shape[0]
         cum_ler += ler * z.shape[0]
@@ -166,7 +177,7 @@ def train(model, device, train_loader, optimizer, epoch, LR):
             logging.info(
                 f'Training epoch {epoch}, Batch {batch_idx + 1}/{len(train_loader)}: LR={LR:.2e}, Loss={cum_loss / cum_samples:.5e} BER={cum_ber / cum_samples:.3e} LER={cum_ler / cum_samples:.3e}')
             logging.info(
-                f'***Loss={cum_loss / cum_samples:.5e} Loss LER={cum_loss3 / cum_samples:.5e} Loss BER={cum_loss1 / cum_samples:.5e} Loss noise pred={cum_loss2 / cum_samples:.5e}')
+                f'***Loss={cum_loss / cum_samples:.5e} Loss LER={cum_loss3 / cum_samples:.5e} Loss BER={cum_loss1 / cum_samples:.5e} Loss noise pred={cum_loss2 / cum_samples:.5e} Loss SSL={cum_loss_ssl / cum_samples:.5e}')
     logging.info(f'Epoch {epoch} Train Time {time.time() - t}s\n')
     return cum_loss / cum_samples, cum_ber / cum_samples, cum_ler / cum_samples
 
@@ -182,8 +193,8 @@ def test(model, device, test_loader_list, ps_range_test, cum_count_lim=100000):
             test_ber = test_ler = cum_count = 0.
             while True:
                 (x, z, y, magnitude, syndrome) = next(iter(test_loader))
-                z_pred = model(magnitude.to(device), syndrome.to(device))
-                _ = model.module.loss(-z_pred, z.to(device))
+                z_pred,z_layers_pred = model(magnitude.to(device), syndrome.to(device))
+                _ = model.module.loss(-z_pred, z.to(device), z_layers_pred)
                 z_pred = sign_to_bin(torch.sign(-z_pred))
 
                 test_ber += BER(z_pred, z.to(device)) * z.shape[0]
@@ -222,7 +233,9 @@ def main(args):
     if args.repetitions > 1:
         from Model_T_measurements import ECC_Transformer
     else:
-        from Model import ECC_Transformer
+        #from Model import ECC_Transformer
+        #from Model_QCrossMPC import ECC_Transformer
+        from Model_QCrossMPC_multiLoss import ECC_Transformer
 
     #################################
     model = ECC_Transformer(args, dropout=0).to(device)
@@ -242,7 +255,7 @@ def main(args):
     ###
     ps_train = ps_test
 
-    train_dataloader = DataLoader(QECC_Dataset(code, ps_train, len=args.batch_size * 5000, args=args), batch_size=int(args.batch_size),
+    train_dataloader = DataLoader(QECC_Dataset(code, ps_train, len=args.batch_size * 500, args=args), batch_size=int(args.batch_size),
                                   shuffle=True, num_workers=args.workers)
     test_dataloader_list = [DataLoader(QECC_Dataset(code, [ps_test[ii]], len=int(args.test_batch_size),args=args),
                                        batch_size=int(args.test_batch_size), shuffle=False, num_workers=args.workers) for ii in range(len(ps_test))]
@@ -260,7 +273,11 @@ def main(args):
         if epoch % 60 == 0 or epoch in [1, args.epochs]:
             test(model, device, test_dataloader_list, ps_test)
     ###
-    model = torch.load(os.path.join(args.path, 'best_model')).to(device)
+    #model = torch.load(os.path.join(args.path, 'best_model')).to(device)
+    model = torch.load(
+        os.path.join(args.path, 'best_model'),
+        weights_only=False  # revert to the ≤2.5 default
+    ).to(device)
     logging.info('Best model loaded')
     ps_test = np.linspace(0.01, 0.2, 18)
     if args.noise_type == 'depolarization':
@@ -278,8 +295,8 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch DQEC')
     parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--workers', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--workers', type=int, default=0)
+    parser.add_argument('--lr', type=float, default=4e-4)
     parser.add_argument('--gpus', type=str, default='0', help='gpus ids')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--test_batch_size', type=int, default=512)
@@ -293,12 +310,12 @@ if __name__ == '__main__':
 
     # model args
     parser.add_argument('--N_dec', type=int, default=6,help='Number of QECCT self-attention modules')
-    parser.add_argument('--d_model', type=int, default=128,help='QECCT dimension')
+    parser.add_argument('--d_model', type=int, default=128,help='QECCT dimension') #orig: 32
     parser.add_argument('--h', type=int, default=16,help='Number of heads')
 
     # qecc args
     parser.add_argument('--lambda_loss_ber', type=float, default=0.5,help='BER loss regularization')
-    parser.add_argument('--lambda_loss_ler', type=float, default=1.,help='LER loss regularization')
+    parser.add_argument('--lambda_loss_ler', type=float, default=1.,help='LER loss regularization') #orig: 1.0
     parser.add_argument('--lambda_loss_n_pred', type=float, default=0.5,help='g noise prediction regularization')
     
     # ablation args
@@ -313,8 +330,8 @@ if __name__ == '__main__':
     if args.no_g > 0:
         args.lambda_loss_n_pred= 0.
     ###
-    class Code():
-        pass
+    # class Code():
+    #     pass
     code = Code()
     H,Lx = eval(f'Get_{args.code_type}_Code')(args.code_L,full_H=args.noise_type == 'depolarization')
     code.logic_matrix = torch.from_numpy(Lx).long()
