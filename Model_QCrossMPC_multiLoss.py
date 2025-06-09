@@ -186,6 +186,11 @@ class ECC_Transformer(nn.Module):
         self.contrastive_proj = clones(nn.Linear(args.d_model, args.d_model, bias=False), args.N_dec)
         self.log_tau = nn.Parameter(torch.tensor(math.log(0.07)))
         ##################
+
+        # ---- Choose probe weight for GradNorm ----
+        self.anchor = self.decoder.layers[0].self_attn.linears[0].weight
+        # ----------------------------------------------
+
         #
         N_in = 5
         non_lin_fun = torch.nn.GELU

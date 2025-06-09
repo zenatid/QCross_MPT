@@ -156,14 +156,21 @@ def train(model, device, train_loader, optimizer, epoch, LR):
         loss3 = F.binary_cross_entropy_with_logits((diff_GF2_mul(train_loader.dataset.logic_matrix,bin_fun(-z_pred))),logical_flipped(train_loader.dataset.logic_matrix, z.to(device)))
 
         ###
-        # with torch.no_grad():
-        #     g_ler = torch.autograd.grad(loss3, z_pred, retain_graph=True)[0].abs().mean()
-        #     g_ssl = torch.autograd.grad(loss_ssl, z_pred, retain_graph=True)[0].abs().mean()
-        # alpha_ssl = 0.3 * (g_ler / (g_ssl + 1e-12)).clamp(max=1.0)
+        with torch.no_grad():  # disables recording
+            # --- pick the probe weight ---------------------------------
+            if isinstance(model, torch.nn.DataParallel):
+                anchor = model.module.anchor
+            else:
+                anchor = model.anchor
+            # ------------------------------------------------------------
+            g_ler = torch.autograd.grad(loss3, anchor, retain_graph=True, create_graph=False)[0].norm()  # grad is still computed
+            g_ssl = torch.autograd.grad(loss_ssl, anchor, retain_graph=True, create_graph=False)[0].norm()
+            alpha_ssl = (0.3 * g_ler / (g_ssl + 1e-12)).clamp(max=0.3)
         ###
-        if epoch > 40:
+        if epoch > 25:
             args.lambda_loss_n_pred = 0.0
-        loss = args.lambda_loss_ber*np.exp(-epoch/60)*loss1 +args.lambda_loss_n_pred*loss2+args.lambda_loss_ler*loss3 + 0.3*min(1, epoch/40)*loss_ssl
+        #loss = min(0.05,args.lambda_loss_ber*np.exp(-epoch/60))*loss1 +args.lambda_loss_n_pred*loss2+args.lambda_loss_ler*loss3 + 0.3*min(1, epoch/40)*loss_ssl
+        loss = max(0.01, args.lambda_loss_ber * np.exp(-epoch / 60)) * loss1 + args.lambda_loss_n_pred * loss2 + args.lambda_loss_ler * loss3 + alpha_ssl * loss_ssl
         model.zero_grad()
         loss.backward()
         optimizer.step()
