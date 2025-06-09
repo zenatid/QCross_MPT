@@ -6,6 +6,8 @@ from __future__ import print_function
 import argparse
 import random
 import os
+
+import numpy as np
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from torch.utils import data
@@ -152,8 +154,16 @@ def train(model, device, train_loader, optimizer, epoch, LR):
         #         logical_flipped(train_loader.dataset.logic_matrix, z.to(device)))
         #     w += 0.05
         loss3 = F.binary_cross_entropy_with_logits((diff_GF2_mul(train_loader.dataset.logic_matrix,bin_fun(-z_pred))),logical_flipped(train_loader.dataset.logic_matrix, z.to(device)))
-        ler_weight = min(1.0, epoch / 30)
-        loss = args.lambda_loss_ber*loss1/args.N_dec +args.lambda_loss_n_pred*loss2+args.lambda_loss_ler*loss3 + args.lambda_loss_ler*loss_ssl/ args.N_dec
+
+        ###
+        # with torch.no_grad():
+        #     g_ler = torch.autograd.grad(loss3, z_pred, retain_graph=True)[0].abs().mean()
+        #     g_ssl = torch.autograd.grad(loss_ssl, z_pred, retain_graph=True)[0].abs().mean()
+        # alpha_ssl = 0.3 * (g_ler / (g_ssl + 1e-12)).clamp(max=1.0)
+        ###
+        if epoch > 40:
+            args.lambda_loss_n_pred = 0.0
+        loss = args.lambda_loss_ber*np.exp(-epoch/60)*loss1 +args.lambda_loss_n_pred*loss2+args.lambda_loss_ler*loss3 + 0.3*min(1, epoch/40)*loss_ssl
         model.zero_grad()
         loss.backward()
         optimizer.step()
@@ -294,11 +304,11 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch DQEC')
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--workers', type=int, default=0)
-    parser.add_argument('--lr', type=float, default=4e-4)
+    parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--gpus', type=str, default='0', help='gpus ids')
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--test_batch_size', type=int, default=512)
     parser.add_argument('--seed', type=int, default=42)
 

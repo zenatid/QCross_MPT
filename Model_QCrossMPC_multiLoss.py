@@ -181,6 +181,11 @@ class ECC_Transformer(nn.Module):
             *[nn.Linear(args.d_model, 1)])
         self.out_fc = nn.Linear(code.n + code.pc_matrix.size(0), code.n)
 
+        ## InfoNCE loss ##
+        #nn.Linear(args.d_model, args.d_model, bias=False)
+        self.contrastive_proj = clones(nn.Linear(args.d_model, args.d_model, bias=False), args.N_dec)
+        self.log_tau = nn.Parameter(torch.tensor(math.log(0.07)))
+        ##################
         #
         N_in = 5
         non_lin_fun = torch.nn.GELU
@@ -242,10 +247,15 @@ class ECC_Transformer(nn.Module):
         ####
         loss1 = 0.0
         loss_ssl = 0.0
-        for emb in emb_layers:
-            z_inter = self.out_fc(self.oned_final_embed(emb).squeeze(-1))
-            loss1 += F.binary_cross_entropy_with_logits(-z_inter, 1 - z2)
-            loss_ssl += info_nce(F.normalize(emb.mean(dim=1),dim=-1), class_id, t=0.07)
+        l = 1.0
+        for emb, contrastive_head in zip(emb_layers,self.contrastive_proj):
+            #z_inter = self.out_fc(self.oned_final_embed(emb).squeeze(-1))
+            #loss1 += F.binary_cross_entropy_with_logits(-z_inter, 1 - z2)
+            emb_proj = F.normalize(contrastive_head(emb).mean(dim=1),dim=-1)
+            #tau = self.log_tau.exp().clamp_(0.03, 0.3)
+            tau = (self.log_tau.exp() + 1e-6).clamp(0.03, 0.3)
+            loss_ssl += 2**(-l)*info_nce(emb_proj, class_id, t=tau)
+            l += 1.0
         loss1 += F.binary_cross_entropy_with_logits(z_pred, 1-z2)
         loss2 = F.binary_cross_entropy_with_logits(self.magnitude_pred, 1-z2)
         ###
@@ -276,7 +286,7 @@ class ECC_Transformer(nn.Module):
                 for jj in idx:
                     mask[ii, jj] += 1
 
-            np.savetxt('mask.txt', ~ (mask > 0), fmt='%d', delimiter=',')
+           # np.savetxt('mask.txt', ~ (mask > 0), fmt='%d', delimiter=',')
             src_mask = ~ (mask > 0).unsqueeze(0).unsqueeze(0)
             return src_mask
 
