@@ -7,10 +7,16 @@ import copy
 import logging
 from Codes import sign_to_bin
 import numpy as np
-
+from losses import *
+from SupConLoss import *
 def clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
+def _incidence_to_mask(mat: torch.Tensor) -> torch.Tensor:
+    """Return boolean mask [1,*,*] for attn  (True = BLOCK)."""
+    # mat: [M,N] with 1 where edge exists
+    mask = ~(mat.bool()).unsqueeze(0).unsqueeze(0)  # [1,1,M,N]
+    return mask
 
 class Encoder(nn.Module):
     def __init__(self, layer, N):
@@ -148,6 +154,7 @@ def info_nce(z: torch.Tensor, class_id: torch.Tensor, t: float = 0.1) -> torch.T
     return loss_vec[valid].mean() if valid.any() else z.new_tensor(0.0)
 
 #################################
+#################################
 
 #########################
 ####### Model  ##########
@@ -162,15 +169,67 @@ class ECC_Transformer(nn.Module):
         self.pc_matrix = code.pc_matrix
         self.logic_matrix = code.logic_matrix
         self.n_phys_qubits = code.n
+
         c = copy.deepcopy
         attn = MultiHeadedAttention(args.h, args.d_model)
         ff = PositionwiseFeedForward(args.d_model, args.d_model * 4, dropout)
 
+        # positional encodings
         self.src_embed_VN = torch.nn.Parameter(torch.empty(
             (code.n, args.d_model)))
-
         self.src_embed_CN = torch.nn.Parameter(torch.empty(
             (code.pc_matrix.size(0), args.d_model)))
+        self.src_embed_LP = torch.nn.Parameter(torch.empty(
+            (code.logic_matrix.size(0), args.d_model)))
+
+        # ---------------------------------------------------------------------
+        # inside ECC_Transformer.__init__(...)
+        #     n      = number of variable-nodes  (physical qubits)
+        #     m      = number of check-nodes     (syndrome bits)
+        #     k      = number of logical qubits  (= code.logic_matrix.size(0))
+        # ---------------------------------------------------------------------
+        # 1. construct the incidence matrix that already contains the
+        #    extra logical-parity rows
+        M_checks = code.pc_matrix.bool()  # shape [m , n]   (H)
+        M_logic = code.logic_matrix.bool()  # shape [k , n]   (L)
+        M_stack = torch.cat([M_checks, M_logic], dim=0)  # [m+k , n]
+
+        m_k = M_stack.size(0)  # total CN+LP tokens
+        device = M_stack.device
+
+        # 2. build masks  ------------------------------------------------------
+        if args.no_mask:  # <-- command-line flag to disable masking
+            self.src_mask_VN = None  # Let attention see everybody
+            self.src_mask_CN = None
+        else:
+            # -- convert incidence to boolean mask ---------------------------------
+            # VN query  ->  CN+LP key
+            #   mask_VN[q,k]  == True  ⟹  *forbid* attention VN_q -> CNLP_k
+            self.src_mask_VN = (~M_stack.T).unsqueeze(0).unsqueeze(0)
+            # [1, 1, n   , m+k]
+
+            # CN+LP query  ->  VN key
+            self.src_mask_CN = (~M_stack).unsqueeze(0).unsqueeze(0)
+            # [1, 1, m+k , n]
+
+            # move to same device / dtype as rest of model
+            self.src_mask_VN = self.src_mask_VN.to(device)
+            self.src_mask_CN = self.src_mask_CN.to(device)
+
+        print('mask VN ', None if self.src_mask_VN is None
+        else self.src_mask_VN.shape,
+              'mask CN ', None if self.src_mask_CN is None
+              else self.src_mask_CN.shape)
+        # ---------------------------------------------------------------------
+
+        k = code.logic_matrix.size(0)          # # logical qubits (2 for toric code)
+        m = code.pc_matrix.size(0)             # # check operators
+        self.lp_head = nn.Sequential(          # <- NEW head
+            nn.Linear(m, 4*m),
+            nn.GELU(),
+            nn.Linear(4*m, k)
+        )
+        self.pool = nn.AdaptiveAvgPool1d(1)  # pools over the 'node' axis
 
         self.N_size = args.N_dec
 
@@ -179,17 +238,16 @@ class ECC_Transformer(nn.Module):
 
         self.oned_final_embed = torch.nn.Sequential(
             *[nn.Linear(args.d_model, 1)])
-        self.out_fc = nn.Linear(code.n + code.pc_matrix.size(0), code.n)
+        #self.out_fc = nn.Linear(code.n + code.pc_matrix.size(0), code.n)
+        self.out_fc = nn.Linear(args.d_model, code.n)
 
         ## InfoNCE loss ##
         #nn.Linear(args.d_model, args.d_model, bias=False)
         self.contrastive_proj = clones(nn.Linear(args.d_model, args.d_model, bias=False), args.N_dec)
+        self.ber_proj = clones(torch.nn.Sequential(*[nn.Linear(args.d_model, 1)]), args.N_dec)
+        self.oned_final_proj = clones(nn.Linear(code.n + code.pc_matrix.size(0), code.n), args.N_dec)
         self.log_tau = nn.Parameter(torch.tensor(math.log(0.07)))
         ##################
-
-        # ---- Choose probe weight for GradNorm ----
-        self.anchor = self.decoder.layers[0].self_attn.linears[0].weight
-        # ----------------------------------------------
 
         #
         N_in = 5
@@ -202,7 +260,7 @@ class ECC_Transformer(nn.Module):
         self.syn_to_noise = torch.nn.Sequential(*layers)
         #
 
-        self.get_mask(code)
+        #self.get_mask(code)
         if args.no_mask > 0:
             self.src_mask = None
         logging.info(f'Mask:\n {self.src_mask_VN}')
@@ -212,33 +270,71 @@ class ECC_Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
         self.magnitude_pred = []
 
+    def _build_masks(self, code, force_dense=False):
+        if force_dense:
+            self.register_buffer('src_mask_VN', None)
+            self.register_buffer('src_mask_CN', None)
+            return
+        # VN↔CN incidence
+        M_vn_cn = code.pc_matrix.clone()                          # [m,n]
+        # VN↔LP incidence  (logic matrix acts on physical qubits)
+        M_vn_lp = code.logic_matrix.clone()                       # [k,n]
+
+        # Full set of "check-side tokens" = [CN • LP]     (size m+k)
+        M_stack = torch.cat([M_vn_cn, M_vn_lp], dim=0)            # [(m+k), n]
+
+        # Masks for the two attention calls in the *bi-partite* layer
+        self.register_buffer('src_mask_VN', _incidence_to_mask(M_stack.t())) # VN queries
+        self.register_buffer('src_mask_CN', _incidence_to_mask(M_stack))     # CN+LP query
+
+    @torch.no_grad()
+    def _logical_parity(self, synd: torch.Tensor) -> torch.Tensor:
+        """
+        Predict   \hat b_L  from syndrome.  Returns hard 0/1 bits  [B,k].
+        """
+        logits = self.lp_head(synd)            # [B,k]
+        return (logits.sigmoid() > 0.5).float()                                  # [B,k]
+
     def forward(self, magnitude, syndrome):
-        magnitude = self.syn_to_noise(syndrome) #[B,n_code]
+        """magnitude: dummy placeholder (ignored); syndrome: [B,m]."""
+        # (0) Predict qubit reliabilities (syn_to_noise)
+        magnitude = self.syn_to_noise(syndrome) # [B,n] logits
         if self.no_g:
             magnitude = magnitude*0+1
-
         self.magnitude_pred.append(magnitude)
 
-        VN = magnitude.unsqueeze(-1)  #[B,n_code, 1]
-        CN = syndrome.unsqueeze(-1)   #[B,n_syndrome, 1]
+        self.syndrome = syndrome
+        if self.no_g:  # ablation flag
+            magnitude = magnitude * 0 + 1.
 
-        VN = self.src_embed_VN.unsqueeze(0) * VN #[B,n_code, d]
-        CN = self.src_embed_CN.unsqueeze(0) * CN #[B,n_syndrome, d]
-        emb1, emb2, layer_outputs = self.decoder(VN, CN, self.src_mask_VN, self.src_mask_CN)
-        emb = torch.cat([emb1, emb2], dim=1)
-        # inter_outputs = []
-        # for layer_output in layer_outputs:
-        #     inter_outputs.append(self.out_fc(self.oned_final_embed(layer_output).squeeze(-1)))
+        # (1) Build three token streams -------------------------------------------------
+        VN = self.src_embed_VN.unsqueeze(0) * magnitude.unsqueeze(-1)  # [B,n,d]
+        CN = self.src_embed_CN.unsqueeze(0) * syndrome.unsqueeze(-1)  # [B,m,d]
 
-        return self.out_fc(self.oned_final_embed(emb).squeeze(-1)), layer_outputs#inter_outputs
+        b_L = self._logical_parity(syndrome)  # [B,k]
+        LP = self.src_embed_LP.unsqueeze(0) * b_L.unsqueeze(-1)  # [B,k,d]
 
-    # def loss(self, z_pred, z2, y):
-    #     loss = F.binary_cross_entropy_with_logits(
-    #         z_pred, sign_to_bin(torch.sign(z2)))
-    #     x_pred = sign_to_bin(torch.sign(-z_pred * torch.sign(y)))
-    #     return loss, x_pred
+        # Stack CN and LP so that part-2 of bi-attn gets (m+k) tokens
+        CNLP = torch.cat([CN, LP], dim=1)  # [B,m+k,d]
 
-    def loss(self, z_pred, z2, emb_layers):
+        # (2) Cross-message passing  VN ↔ CNLP
+        emb_VN, emb_CNLP, inter = self.decoder(VN, CNLP, self.src_mask_VN, self.src_mask_CN)
+        # 1. after you have the node-embeddings:
+        #    emb_VN : [B, n, d]
+        #    emb_CNLP : [B, m + k, d]
+        #    --> concatenate on node axis
+        nodes = torch.cat([emb_VN, emb_CNLP], dim=1)  # [B, n + m + k, d]
+
+        # 2. transpose so that AdaptiveAvgPool1d pools over nodes
+        nodes = nodes.transpose(1, 2)  # [B, d, n + m + k]
+        pooled = self.pool(nodes).squeeze(-1)  # [B, d]
+
+        # 3. final projection
+        out = self.out_fc(pooled)  # [B, n]
+
+        return out, inter, b_L  # <- return LP parity for auxiliary losses
+
+    def loss(self, z_pred, z2, emb_layers, b_L):
         #dealing with DP activations
         indices = [xx.device.index for xx in self.magnitude_pred]
         if len(list(set(indices))) > 1:
@@ -248,24 +344,27 @@ class ECC_Transformer(nn.Module):
             self.magnitude_pred = self.magnitude_pred[0]
         ####
         class_id = logical_class_from_true_err(z2, self.logic_matrix).to(z2.device)
-        #z_emb = F.normalize(.mean(dim=1)  , dim=-1)  # [B,d]
         ####
-        loss1 = 0.0
+        loss_ber_reg = 0.0
         loss_ssl = 0.0
         l = 1.0
-        for emb, contrastive_head in zip(emb_layers,self.contrastive_proj):
-            #z_inter = self.out_fc(self.oned_final_embed(emb).squeeze(-1))
-            #loss1 += F.binary_cross_entropy_with_logits(-z_inter, 1 - z2)
-            emb_proj = F.normalize(contrastive_head(emb).mean(dim=1),dim=-1)
-            #tau = self.log_tau.exp().clamp_(0.03, 0.3)
-            tau = (self.log_tau.exp() + 1e-6).clamp(0.03, 0.3)
-            loss_ssl += 2**(-l)*info_nce(emb_proj, class_id, t=tau)
+        for emb, contrastive_head, ber_head, oned_head in zip(emb_layers,self.contrastive_proj, self.ber_proj, self.oned_final_proj):
+            # z_inter = oned_head(ber_head(emb).squeeze(-1))
+            # loss_ber_reg += F.binary_cross_entropy_with_logits(-z_inter, 1 - z2)
+            # emb_proj = F.normalize(contrastive_head(emb).mean(dim=1),dim=-1)
+            # loss_ssl += info_nce(emb_proj, class_id)
             l += 1.0
-        loss1 += F.binary_cross_entropy_with_logits(z_pred, 1-z2)
+        loss1 = F.binary_cross_entropy_with_logits(z_pred, 1-z2)
         loss2 = F.binary_cross_entropy_with_logits(self.magnitude_pred, 1-z2)
+
+        #lp_logits = ( self.logic_matrix.float() @ z_pred.T ).T         # [B,k] float
+        loss_lp = F.binary_cross_entropy_with_logits(
+            self.lp_head(self.syndrome),  # [B,k] logits
+            (self.logic_matrix.float() @ z2.T).T)
+
         ###
         self.magnitude_pred = []
-        return loss1,loss2, loss_ssl
+        return loss1,loss2, loss_ssl, loss_ber_reg, loss_lp
 
 
     def get_mask(self, code, no_mask=False):

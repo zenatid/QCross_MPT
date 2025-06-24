@@ -5,8 +5,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-LOG_PATH = Path(r"C:\Users\DAVIDZEN\DQEC_CrossMPC\Final_Results_QECCT\toric\Code_L_4\noise_model_independent\repetition_1\08_06_2025_11_17_57\logging.txt")
+LOG_PATH = Path(r"C:\Users\DAVIDZEN\DQEC_CrossMPC_logical\Final_Results_QECCT\toric\Code_L_4\noise_model_independent\repetition_1\24_06_2025_16_38_36\logging.txt")
 assert LOG_PATH.exists(), "Log file not found at expected location."
+OUTPUT_DIR = LOG_PATH.parent
 
 text = LOG_PATH.read_text()
 
@@ -35,7 +36,8 @@ ns_dict["path_to_logs"] = model_path
 
 # Save as CSV
 param_df = pd.DataFrame(list(ns_dict.items()), columns=["parameter", "value"])
-param_csv_path = Path( "/mnt/data/namespace_params.csv")
+#param_csv_path = Path( "/mnt/data/namespace_params.csv")
+param_csv_path = OUTPUT_DIR / "namespace_params.csv"
 param_df.to_csv(param_csv_path, index=False)
 
 # ---------------------------
@@ -46,7 +48,7 @@ epoch_data = {}
 
 # Patterns for batch lines
 batch_pattern = re.compile(
-    r"Training epoch\s+(\d+),\s+Batch\s+(250|500)/500:\s+LR=([0-9eE\+\-\.]+),\s+Loss=([0-9eE\+\-\.]+)\s+BER=([0-9eE\+\-\.]+)\s+LER=([0-9eE\+\-\.]+)"
+    r"Training epoch\s+(\d+),\s+Batch\s+(50|100)/100:\s+LR=([0-9eE\+\-\.]+),\s+Loss=([0-9eE\+\-\.]+)\s+BER=([0-9eE\+\-\.]+)\s+LER=([0-9eE\+\-\.]+)"
 )
 
 # Pattern for detailed loss line following batch line (***Loss=...)
@@ -128,14 +130,16 @@ for ax in axes[n_metrics:]:
     ax.axis("off")
 
 fig.tight_layout()
-plots_path = Path("/mnt/data/log_metrics.png")
+#plots_path = Path("/mnt/data/log_metrics.png")
+plots_path = OUTPUT_DIR / "log_metrics.png"
 fig.savefig(plots_path, dpi=150)
 
 # ---------------------------
 # 5. Extract mask tensor and save image
 # ---------------------------
 mask_match = re.search(r"Mask:\s*tensor\((\[.*?])\)", text, re.DOTALL)
-mask_img_path = Path("/mnt/data/mask.png")
+#mask_img_path = Path("/mnt/data/mask.png")
+mask_img_path = OUTPUT_DIR / "mask.png"
 if mask_match:
     mask_str = mask_match.group(1)
     # Replace True/False with Python literals (they already are) and eval safely
@@ -164,7 +168,8 @@ else:
 # 6. Generate model diagram (markdown bullet list)
 # ---------------------------
 model_section_match = re.search(r"DataParallel\((.*?)# of Parameters:", text, re.DOTALL)
-diagram_md_path = Path("/mnt/data/model_diagram.md")
+#diagram_md_path = Path("/mnt/data/model_diagram.md")
+diagram_md_path = OUTPUT_DIR / "model_diagram.md"
 if model_section_match:
     model_text = model_section_match.group(1)
     # Clean up indentation -> bullet hierarchy

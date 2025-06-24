@@ -88,7 +88,82 @@ class ToricCode:
             E.append(self.flatZflips2Xerr)
         E = scipy.linalg.block_diag(*E)
         return E
-
+##########################################################################################
+class RotatedSurfaceCode:
+    def __init__(self, L):
+        '''Rotated surface code of `` L**2`` physical qubits and distance ``L``.'''
+        self.L = L
+        self.num_stabilizers = (L - 1) * (L + 1) // 2
+        self.num_qubits = L * L
+        self.H_X = np.zeros((self.num_stabilizers, self.num_qubits), dtype=int)
+        self.H_Z = np.zeros((self.num_stabilizers, self.num_qubits), dtype=int)
+        self.L_X = np.zeros((1, self.num_qubits), dtype=int)
+        self.L_Z = np.zeros((1, self.num_qubits), dtype=int)
+        self.generate_parity_check_matrices()
+        self.generate_logical_operators()
+    def generate_parity_check_matrices(self):
+        stabilizerX_idx = stabilizerZ_idx = 0
+        L = self.L
+        # Loop for each l and k to create stabilizers
+        for l in range(L - 1):
+            z_stab = [
+                l * L + (L - 1) * (l % 2),
+                (l + 1) * L + (L - 1) * (l % 2)
+            ]
+            self.add_stabilizer(self.H_Z, stabilizerZ_idx, z_stab)
+            stabilizerZ_idx += 1
+            for k in range((L - 1) // 2):
+                if l == 0 or l == L - 2:
+                    x_stab = [
+                        (l + 1) * (l + 1 + l % 2) + 2 * k,
+                        (l + 1) * (l + 1 + l % 2) + 1 + 2 * k
+                    ]
+                    self.add_stabilizer(self.H_X, stabilizerX_idx, x_stab)
+                    stabilizerX_idx += 1
+                intercep_x_k = l % 2 + 2 * k
+                intercep_z_k = (l + 1) % 2 + 2 * k
+                # X-stabilizer (l*L + intercep_x_k, l*L +1+ intercep_x_k, L*(l+1) + intercep_x_k, L*(l+1) +1+ intercep_x_k)
+                x_stab = [
+                    l * L + intercep_x_k,
+                    l * L + 1 + intercep_x_k,
+                    (l + 1) * L + intercep_x_k,
+                    (l + 1) * L + 1 + intercep_x_k
+                ]
+                self.add_stabilizer(self.H_X, stabilizerX_idx, x_stab)
+                stabilizerX_idx += 1
+                # Z-stabilizer (l*L + intercep_z_k, l*L +1+ intercep_z_k, L*(l+1) + intercep_z_k, L*(l+1) +1+ intercep_z_k)
+                z_stab = [
+                    l * L + intercep_z_k,
+                    l * L + 1 + intercep_z_k,
+                    (l + 1) * L + intercep_z_k,
+                    (l + 1) * L + 1 + intercep_z_k
+                ]
+                self.add_stabilizer(self.H_Z, stabilizerZ_idx, z_stab)
+                stabilizerZ_idx += 1
+    def add_stabilizer(self, H, stabilizer_idx, qubit_indices):
+        """ Helper function to add a stabilizer row to the parity check matrix """
+        for qubit_idx in qubit_indices:
+            H[stabilizer_idx, qubit_idx] = 1
+    def generate_logical_operators(self):
+        for l in range(self.L):
+            self.L_Z[:, l] = 1
+            self.L_X[:, l * self.L] = 1
+    def H(self, Z=True, X=False):
+        H = []
+        if Z:
+            H.append(self.H_Z)
+        if X:
+            H.append(self.H_X)  # indep noise
+        H = scipy.linalg.block_diag(*H)
+        return H
+    def E(self, Z=True, X=False):
+        E = []
+        if Z:
+            E.append(self.L_X)
+        if X:
+            E.append(self.L_Z)
+        E = scipy.linalg.block_diag(*E)
+        return E
 ##########################################################################################
 
 def sign_to_bin(x):
@@ -114,9 +189,14 @@ def Get_toric_Code(L,full_H=False):
     logX = toric.E(Z=full_H,X=True)    
     return Hx, logX
 
-
+def Get_rotated_surface_Code(L,full_H=False):
+    rot_Surface = RotatedSurfaceCode(L)
+    Hx = rot_Surface.H(Z=full_H,X=True)
+    logX = rot_Surface.E(Z=full_H,X=True)
+    return Hx, logX
 #############################################
 if __name__ == "__main__":
     Get_toric_Code(4)
+    Get_rotated_surface_Code(3)
     class Code:
         pass

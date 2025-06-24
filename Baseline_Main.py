@@ -179,14 +179,14 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch QECCT')
-    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--workers', type=int, default=0)
     parser.add_argument('--gpus', type=str, default='-1', help='gpus ids')
     parser.add_argument('--test_batch_size', type=int, default=2048)
     parser.add_argument('--seed', type=int, default=42)
 
     # Code args
     parser.add_argument('--code_type', type=str, default='toric',choices=['toric','surface'])
-    parser.add_argument('--code_L', type=int, default=8)
+    parser.add_argument('--code_L', type=int, default=4)
     parser.add_argument('--repetitions', type=int, default=1)
     parser.add_argument('--noise_type', type=str,default='depolarization', choices=['independent','depolarization'])
     #    
