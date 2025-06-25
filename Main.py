@@ -345,7 +345,8 @@ if __name__ == '__main__':
     code.logic_matrix = torch.from_numpy(Lx).long()
     code.pc_matrix = torch.from_numpy(H).long()
     code.n = code.pc_matrix.shape[1]
-    code.k = code.n - code.pc_matrix.shape[0]
+    code.m = code.pc_matrix.shape[0]
+    code.k = code.logic_matrix.shape[0]
     code.code_type = args.code_type
     args.code = code
     ####################################################################

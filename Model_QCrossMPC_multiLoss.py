@@ -7,8 +7,6 @@ import copy
 import logging
 from Codes import sign_to_bin
 import numpy as np
-from losses import *
-from SupConLoss import *
 def clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
@@ -26,16 +24,19 @@ class Encoder(nn.Module):
         if N > 1:
             self.norm2 = LayerNorm(layer.size)
 
-    def forward(self, x, x2, mask_VN, mask_CN):
+    def forward(self, x, x2, x3, mask_VN, mask_CN, mask_LN):
         layer_outputs = []
         for idx, layer in enumerate(self.layers, start=1):
-            x = layer(x, x2, mask_VN)
-            x2 = layer(x2, x, mask_CN)
+            x = layer(x, torch.cat([x, x2, x3], dim=1), mask_VN)
+            x2 = layer(x2, torch.cat([x, x2, x3], dim=1), mask_CN)
+            x3 = layer(x3, torch.cat([x, x2, x3], dim=1), mask_LN)
             if idx == len(self.layers) // 2 and len(self.layers) > 1:
                 x = self.norm2(x)
                 x2 = self.norm2(x2)
-            layer_outputs.append(torch.cat([x, x2], dim=1))
-        return self.norm(x), self.norm(x2), layer_outputs
+                x3 = self.norm2(x3)
+            #layer_outputs.append(torch.cat([x, x2], dim=1))
+            layer_outputs.append(x3)
+        return self.norm(x), self.norm(x2), self.norm(x3), layer_outputs
 
 class SublayerConnection(nn.Module):
     def __init__(self, size, dropout):
@@ -175,59 +176,14 @@ class ECC_Transformer(nn.Module):
         ff = PositionwiseFeedForward(args.d_model, args.d_model * 4, dropout)
 
         # positional encodings
-        self.src_embed_VN = torch.nn.Parameter(torch.empty(
-            (code.n, args.d_model)))
-        self.src_embed_CN = torch.nn.Parameter(torch.empty(
-            (code.pc_matrix.size(0), args.d_model)))
-        self.src_embed_LP = torch.nn.Parameter(torch.empty(
-            (code.logic_matrix.size(0), args.d_model)))
+        self.src_embed_VN = torch.nn.Parameter(torch.empty((code.n, args.d_model)))
+        self.src_embed_CN = torch.nn.Parameter(torch.empty((code.pc_matrix.size(0), args.d_model)))
+        self.src_embed_LP = torch.nn.Parameter(torch.empty((code.logic_matrix.size(0), args.d_model)))
 
-        # ---------------------------------------------------------------------
-        # inside ECC_Transformer.__init__(...)
-        #     n      = number of variable-nodes  (physical qubits)
-        #     m      = number of check-nodes     (syndrome bits)
-        #     k      = number of logical qubits  (= code.logic_matrix.size(0))
-        # ---------------------------------------------------------------------
-        # 1. construct the incidence matrix that already contains the
-        #    extra logical-parity rows
-        M_checks = code.pc_matrix.bool()  # shape [m , n]   (H)
-        M_logic = code.logic_matrix.bool()  # shape [k , n]   (L)
-        M_stack = torch.cat([M_checks, M_logic], dim=0)  # [m+k , n]
-
-        m_k = M_stack.size(0)  # total CN+LP tokens
-        device = M_stack.device
-
-        # 2. build masks  ------------------------------------------------------
-        if args.no_mask:  # <-- command-line flag to disable masking
-            self.src_mask_VN = None  # Let attention see everybody
-            self.src_mask_CN = None
-        else:
-            # -- convert incidence to boolean mask ---------------------------------
-            # VN query  ->  CN+LP key
-            #   mask_VN[q,k]  == True  ⟹  *forbid* attention VN_q -> CNLP_k
-            self.src_mask_VN = (~M_stack.T).unsqueeze(0).unsqueeze(0)
-            # [1, 1, n   , m+k]
-
-            # CN+LP query  ->  VN key
-            self.src_mask_CN = (~M_stack).unsqueeze(0).unsqueeze(0)
-            # [1, 1, m+k , n]
-
-            # move to same device / dtype as rest of model
-            self.src_mask_VN = self.src_mask_VN.to(device)
-            self.src_mask_CN = self.src_mask_CN.to(device)
-
-        print('mask VN ', None if self.src_mask_VN is None
-        else self.src_mask_VN.shape,
-              'mask CN ', None if self.src_mask_CN is None
-              else self.src_mask_CN.shape)
-        # ---------------------------------------------------------------------
-
-        k = code.logic_matrix.size(0)          # # logical qubits (2 for toric code)
-        m = code.pc_matrix.size(0)             # # check operators
-        self.lp_head = nn.Sequential(          # <- NEW head
-            nn.Linear(m, 4*m),
+        self.lp_head = nn.Sequential(
+            nn.Linear(code.m, 4*code.m),
             nn.GELU(),
-            nn.Linear(4*m, k)
+            nn.Linear(4*code.m, code.k)
         )
         self.pool = nn.AdaptiveAvgPool1d(1)  # pools over the 'node' axis
 
@@ -249,43 +205,24 @@ class ECC_Transformer(nn.Module):
         self.log_tau = nn.Parameter(torch.tensor(math.log(0.07)))
         ##################
 
-        #
+        # syndrome to noise model
         N_in = 5
         non_lin_fun = torch.nn.GELU
         layers = [torch.nn.Linear(code.pc_matrix.size(0), N_in*code.n), non_lin_fun()]
         for _ in range(1):
             layers += [torch.nn.Linear(N_in*code.n, N_in*code.n),non_lin_fun()]
         layers += [torch.nn.Linear(N_in*code.n, code.n)]
-        #
         self.syn_to_noise = torch.nn.Sequential(*layers)
-        #
+        ####
 
-        #self.get_mask(code)
+        self.get_mask(code)
         if args.no_mask > 0:
             self.src_mask = None
-        logging.info(f'Mask:\n {self.src_mask_VN}')
-        ###
+
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
         self.magnitude_pred = []
-
-    def _build_masks(self, code, force_dense=False):
-        if force_dense:
-            self.register_buffer('src_mask_VN', None)
-            self.register_buffer('src_mask_CN', None)
-            return
-        # VN↔CN incidence
-        M_vn_cn = code.pc_matrix.clone()                          # [m,n]
-        # VN↔LP incidence  (logic matrix acts on physical qubits)
-        M_vn_lp = code.logic_matrix.clone()                       # [k,n]
-
-        # Full set of "check-side tokens" = [CN • LP]     (size m+k)
-        M_stack = torch.cat([M_vn_cn, M_vn_lp], dim=0)            # [(m+k), n]
-
-        # Masks for the two attention calls in the *bi-partite* layer
-        self.register_buffer('src_mask_VN', _incidence_to_mask(M_stack.t())) # VN queries
-        self.register_buffer('src_mask_CN', _incidence_to_mask(M_stack))     # CN+LP query
 
     @torch.no_grad()
     def _logical_parity(self, synd: torch.Tensor) -> torch.Tensor:
@@ -312,18 +249,18 @@ class ECC_Transformer(nn.Module):
         CN = self.src_embed_CN.unsqueeze(0) * syndrome.unsqueeze(-1)  # [B,m,d]
 
         b_L = self._logical_parity(syndrome)  # [B,k]
-        LP = self.src_embed_LP.unsqueeze(0) * b_L.unsqueeze(-1)  # [B,k,d]
+        LN = self.src_embed_LP.unsqueeze(0) * b_L.unsqueeze(-1)  # [B,k,d]
 
         # Stack CN and LP so that part-2 of bi-attn gets (m+k) tokens
-        CNLP = torch.cat([CN, LP], dim=1)  # [B,m+k,d]
+        #CNLP = torch.cat([CN, LP], dim=1)  # [B,m+k,d]
 
         # (2) Cross-message passing  VN ↔ CNLP
-        emb_VN, emb_CNLP, inter = self.decoder(VN, CNLP, self.src_mask_VN, self.src_mask_CN)
+        emb_VN, emb_CN, emb_LN, inter = self.decoder(VN, CN, LN, self.src_mask_VN, self.src_mask_CN, self.src_mask_LN)
         # 1. after you have the node-embeddings:
         #    emb_VN : [B, n, d]
         #    emb_CNLP : [B, m + k, d]
         #    --> concatenate on node axis
-        nodes = torch.cat([emb_VN, emb_CNLP], dim=1)  # [B, n + m + k, d]
+        nodes = torch.cat([emb_VN, emb_CN], dim=1)  # [B, n + m, d]
 
         # 2. transpose so that AdaptiveAvgPool1d pools over nodes
         nodes = nodes.transpose(1, 2)  # [B, d, n + m + k]
@@ -379,8 +316,9 @@ class ECC_Transformer(nn.Module):
                 for jj in idx:
                     mask[ii, jj] += 1
             mask = mask.transpose(0, 1)
-            np.savetxt('mask.txt', ~ (mask > 0), fmt='%d', delimiter=',')
-            src_mask = ~ (mask > 0).unsqueeze(0).unsqueeze(0)
+            mask_VN  = torch.cat([torch.ones(code.n, code.n), mask, torch.ones(code.n, code.k)], dim=1)
+            np.savetxt('mask_VN.txt', ~ (mask_VN > 0), fmt='%d', delimiter=',')
+            src_mask = ~ (mask_VN > 0).unsqueeze(0).unsqueeze(0)
             return src_mask
 
         def build_mask_CN(code):
@@ -389,15 +327,23 @@ class ECC_Transformer(nn.Module):
                 idx = torch.where(code.pc_matrix[ii] > 0)[0]
                 for jj in idx:
                     mask[ii, jj] += 1
+            mask_CN = torch.cat([mask, torch.ones(code.m, code.m + code.k)], dim=1)
+            np.savetxt('mask_CN.txt', ~ (mask_CN > 0), fmt='%d', delimiter=',')
+            src_mask = ~ (mask_CN > 0).unsqueeze(0).unsqueeze(0)
+            return src_mask
 
-           # np.savetxt('mask.txt', ~ (mask > 0), fmt='%d', delimiter=',')
-            src_mask = ~ (mask > 0).unsqueeze(0).unsqueeze(0)
+        def build_mask_LN(code):
+            mask_LN = torch.ones(code.k, code.m  + code.n + code.k)
+            np.savetxt('mask_LN.txt', ~ (mask_LN > 0), fmt='%d', delimiter=',')
+            src_mask = ~ (mask_LN > 0).unsqueeze(0).unsqueeze(0)
             return src_mask
 
         src_mask_VN = build_mask_VN(code)
-        src_mask_CN = build_mask_VN(code).transpose(-1,-2)#build_mask_CN(code)
+        src_mask_CN = build_mask_CN(code)
+        src_mask_LN = build_mask_LN(code)
         self.register_buffer('src_mask_VN', src_mask_VN)
         self.register_buffer('src_mask_CN', src_mask_CN)
+        self.register_buffer('src_mask_LN', src_mask_LN)
 
 
 ############################################################
