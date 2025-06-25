@@ -27,9 +27,12 @@ class Encoder(nn.Module):
     def forward(self, x, x2, x3, mask_VN, mask_CN, mask_LN):
         layer_outputs = []
         for idx, layer in enumerate(self.layers, start=1):
-            x = layer(x, torch.cat([x, x2, x3], dim=1), mask_VN)
-            x2 = layer(x2, torch.cat([x, x2, x3], dim=1), mask_CN)
-            x3 = layer(x3, torch.cat([x, x2, x3], dim=1), mask_LN)
+            # x = layer(x, torch.cat([x, x2, x3], dim=1), mask_VN)
+            # x2 = layer(x2, torch.cat([x, x2, x3], dim=1), mask_CN)
+            # x3 = layer(x3, torch.cat([x, x2, x3], dim=1), mask_LN)
+            x = layer(x, x3, mask_VN)
+            x2 = layer(x2, x, mask_CN)
+            x3 = layer(x3, x2, mask_LN)
             if idx == len(self.layers) // 2 and len(self.layers) > 1:
                 x = self.norm2(x)
                 x2 = self.norm2(x2)
@@ -316,7 +319,8 @@ class ECC_Transformer(nn.Module):
                 for jj in idx:
                     mask[ii, jj] += 1
             mask = mask.transpose(0, 1)
-            mask_VN  = torch.cat([torch.ones(code.n, code.n), mask, torch.ones(code.n, code.k)], dim=1)
+            #mask_VN  = torch.cat([torch.ones(code.n, code.n), mask, torch.ones(code.n, code.k)], dim=1)
+            mask_VN = torch.ones(code.n, code.k)
             np.savetxt('mask_VN.txt', ~ (mask_VN > 0), fmt='%d', delimiter=',')
             src_mask = ~ (mask_VN > 0).unsqueeze(0).unsqueeze(0)
             return src_mask
@@ -327,13 +331,15 @@ class ECC_Transformer(nn.Module):
                 idx = torch.where(code.pc_matrix[ii] > 0)[0]
                 for jj in idx:
                     mask[ii, jj] += 1
-            mask_CN = torch.cat([mask, torch.ones(code.m, code.m + code.k)], dim=1)
+            #mask_CN = torch.cat([mask, torch.ones(code.m, code.m + code.k)], dim=1)
+            mask_CN = mask
             np.savetxt('mask_CN.txt', ~ (mask_CN > 0), fmt='%d', delimiter=',')
             src_mask = ~ (mask_CN > 0).unsqueeze(0).unsqueeze(0)
             return src_mask
 
         def build_mask_LN(code):
-            mask_LN = torch.ones(code.k, code.m  + code.n + code.k)
+            #mask_LN = torch.ones(code.k, code.m  + code.n + code.k)
+            mask_LN = torch.ones(code.k, code.m)
             np.savetxt('mask_LN.txt', ~ (mask_LN > 0), fmt='%d', delimiter=',')
             src_mask = ~ (mask_LN > 0).unsqueeze(0).unsqueeze(0)
             return src_mask
