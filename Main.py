@@ -143,7 +143,7 @@ def diff_GF2_mul(H,x):
 def train(model, device, train_loader, optimizer, epoch, LR):
     model.train()
     cum_loss = cum_ber = cum_ler = cum_samples = 0
-    cum_loss1 = cum_loss2 = cum_loss3 = cum_loss_lp= cum_loss_ber_reg=0
+    cum_loss1 = cum_loss2 = cum_loss3 = cum_loss_lp= cum_loss_ssl=0
     t = time.time()
     # bin_fun = binarization
     bin_fun = torch.sigmoid
@@ -156,7 +156,7 @@ def train(model, device, train_loader, optimizer, epoch, LR):
         #with torch.no_grad():
         loss3 = BCE((diff_GF2_mul(train_loader.dataset.logic_matrix,bin_fun(-z_pred))),logical_flipped(train_loader.dataset.logic_matrix, z.to(device)))
         ###########
-        loss = args.lambda_loss_ber * loss1 + args.lambda_loss_n_pred * loss2 + args.lambda_loss_ler * loss3 + args.lambda_loss_lp * loss_lp + args.lambda_loss_ber_reg * loss_ber_reg
+        loss = args.lambda_loss_ber * loss1 + args.lambda_loss_n_pred * loss2 + args.lambda_loss_ler * loss3 + args.lambda_loss_lp * loss_lp + args.lambda_loss_ssl * loss_ssl
         model.zero_grad()
         loss.backward()
         optimizer.step()
@@ -171,7 +171,7 @@ def train(model, device, train_loader, optimizer, epoch, LR):
         cum_loss2 += loss2.item() * z.shape[0]
         cum_loss3 += loss3.item() * z.shape[0]
         cum_loss_lp += loss_lp.item() * z.shape[0]
-        #cum_loss_ber_reg += loss_ber_reg.item() * z.shape[0]
+        cum_loss_ssl += loss_ssl.item() * z.shape[0]
         #
         cum_ber += ber * z.shape[0]
         cum_ler += ler * z.shape[0]
@@ -181,7 +181,7 @@ def train(model, device, train_loader, optimizer, epoch, LR):
             logging.info(
                 f'Training epoch {epoch}, Batch {batch_idx + 1}/{len(train_loader)}: LR={LR:.2e}, Loss={cum_loss / cum_samples:.5e} BER={cum_ber / cum_samples:.3e} LER={cum_ler / cum_samples:.3e}')
             logging.info(
-                f'***Loss={cum_loss / cum_samples:.5e} Loss LER={cum_loss3 / cum_samples:.5e} Loss BER={cum_loss1 / cum_samples:.5e} Loss noise pred={cum_loss2 / cum_samples:.5e} Loss LP={cum_loss_lp / cum_samples:.5e} Loss ber reg ={cum_loss_ber_reg / cum_samples:.5e}')
+                f'***Loss={cum_loss / cum_samples:.5e} Loss LER={cum_loss3 / cum_samples:.5e} Loss BER={cum_loss1 / cum_samples:.5e} Loss noise pred={cum_loss2 / cum_samples:.5e} Loss LP={cum_loss_lp / cum_samples:.5e} Loss ssl ={cum_loss_ssl / cum_samples:.5e}')
     logging.info(f'Epoch {epoch} Train Time {time.time() - t}s\n')
     return cum_loss / cum_samples, cum_ber / cum_samples, cum_ler / cum_samples
 
@@ -250,7 +250,7 @@ def main(args):
     logging.info(model)
     logging.info(f'# of Parameters: {np.sum([np.prod(p.shape) for p in model.parameters()])}')
     #################################
-    ps_test = np.linspace(0.01, 0.2, 9)
+    ps_test = np.linspace(0.01, 0.1, 9) #fix to 0.2 instead on 0.1
     if args.noise_type == 'depolarization':
         ps_test = np.linspace(0.05, 0.2, 9)
     if args.repetitions > 1:
@@ -299,12 +299,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch DQEC')
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--workers', type=int, default=0)
-    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--lr', type=float, default=4e-4)
     parser.add_argument('--gpus', type=str, default='0', help='gpus ids')
     parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--batch_num', type=int, default=100)
+    parser.add_argument('--batch_num', type=int, default=500)
     parser.add_argument('--test_batch_size', type=int, default=512)
-    parser.add_argument('--weight_decay', type=float, default=5e-8)
+    parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--seed', type=int, default=42)
 
     # Code args
@@ -321,9 +321,9 @@ if __name__ == '__main__':
     # qecc args
     parser.add_argument('--lambda_loss_ber', type=float, default=0.5,help='BER loss regularization')
     parser.add_argument('--lambda_loss_ler', type=float, default=1.0,help='LER loss regularization')
-    parser.add_argument('--lambda_loss_n_pred', type=float, default=0.25,help='g noise prediction regularization')
-    parser.add_argument('--lambda_loss_lp', type=float, default=0.5, help='lp loss regularization')
-    parser.add_argument('--lambda_loss_ssl', type=float, default=0.05,help='InfoNCE loss regularization')
+    parser.add_argument('--lambda_loss_n_pred', type=float, default=0.3,help='g noise prediction regularization')
+    parser.add_argument('--lambda_loss_lp', type=float, default=0.3, help='lp loss regularization')
+    parser.add_argument('--lambda_loss_ssl', type=float, default=0.1,help='InfoNCE loss regularization')
     parser.add_argument('--lambda_loss_ber_reg', type=float, default=0.01, help='BER multi-layer loss regularization')
     
     # ablation args

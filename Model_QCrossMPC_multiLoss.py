@@ -4,9 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import copy
-import logging
-from Codes import sign_to_bin
 import numpy as np
+
+
 def clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
@@ -15,6 +15,9 @@ def _incidence_to_mask(mat: torch.Tensor) -> torch.Tensor:
     # mat: [M,N] with 1 where edge exists
     mask = ~(mat.bool()).unsqueeze(0).unsqueeze(0)  # [1,1,M,N]
     return mask
+
+def logical_flipped(L,x):
+    return torch.matmul(x.float(),L.float()) % 2
 
 class Encoder(nn.Module):
     def __init__(self, layer, N):
@@ -201,7 +204,7 @@ class ECC_Transformer(nn.Module):
         #nn.Linear(args.d_model, args.d_model, bias=False)
         self.contrastive_proj = clones(nn.Linear(args.d_model, args.d_model, bias=False), args.N_dec)
         self.ber_proj = clones(torch.nn.Sequential(*[nn.Linear(args.d_model, 1)]), args.N_dec)
-        self.oned_final_proj = clones(nn.Linear(code.n + code.pc_matrix.size(0), code.n), args.N_dec)
+        self.oned_final_proj = clones(nn.Linear(code.k, code.k), args.N_dec)
         self.log_tau = nn.Parameter(torch.tensor(math.log(0.07)))
         ##################
 
@@ -223,6 +226,7 @@ class ECC_Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
         self.magnitude_pred = []
+        self.logical_class_pred = []
 
     @torch.no_grad()
     def _logical_parity(self, synd: torch.Tensor) -> torch.Tensor:
@@ -234,32 +238,26 @@ class ECC_Transformer(nn.Module):
 
     def forward(self, magnitude, syndrome):
         """magnitude: dummy placeholder (ignored); syndrome: [B,m]."""
+
         # (0) Predict qubit reliabilities (syn_to_noise)
         magnitude = self.syn_to_noise(syndrome) # [B,n] logits
-        if self.no_g:
+        logical_class = self._logical_parity(syndrome)  # [B,k] logits
+        if self.no_g: # ablation flag
             magnitude = magnitude*0+1
+            logical_class = logical_class*0+1
         self.magnitude_pred.append(magnitude)
-
-        self.syndrome = syndrome
-        if self.no_g:  # ablation flag
-            magnitude = magnitude * 0 + 1.
+        self.logical_class_pred.append(logical_class)
 
         # (1) Build three token streams -------------------------------------------------
         VN = self.src_embed_VN.unsqueeze(0) * magnitude.unsqueeze(-1)  # [B,n,d]
         CN = self.src_embed_CN.unsqueeze(0) * syndrome.unsqueeze(-1)  # [B,m,d]
 
-        b_L = self._logical_parity(syndrome)  # [B,k]
-        LN = self.src_embed_LP.unsqueeze(0) * b_L.unsqueeze(-1)  # [B,k,d]
+        logical_class = self._logical_parity(syndrome)  # [B,k]
+        LN = self.src_embed_LP.unsqueeze(0) * logical_class.unsqueeze(-1)  # [B,k,d]
 
-        # Stack CN and LP so that part-2 of bi-attn gets (m+k) tokens
-        #CNLP = torch.cat([CN, LP], dim=1)  # [B,m+k,d]
-
-        # (2) Cross-message passing  VN ↔ CNLP
+        # (2) Cross-message passing
         emb_VN, emb_CN, emb_LN, inter = self.decoder(VN, CN, LN, self.src_mask_VN, self.src_mask_CN, self.src_mask_LN)
-        # 1. after you have the node-embeddings:
-        #    emb_VN : [B, n, d]
-        #    emb_CNLP : [B, m + k, d]
-        #    --> concatenate on node axis
+        # 1. after you have the node-embeddings-concatenate on node axis
         nodes = torch.cat([emb_VN, emb_CN], dim=1)  # [B, n + m, d]
 
         # 2. transpose so that AdaptiveAvgPool1d pools over nodes
@@ -269,7 +267,7 @@ class ECC_Transformer(nn.Module):
         # 3. final projection
         out = self.out_fc(pooled)  # [B, n]
 
-        return out, inter, b_L  # <- return LP parity for auxiliary losses
+        return out, inter, logical_class  # <- return LP parity for auxiliary losses
 
     def loss(self, z_pred, z2, emb_layers, b_L):
         #dealing with DP activations
@@ -279,29 +277,29 @@ class ECC_Transformer(nn.Module):
             self.magnitude_pred = torch.cat([self.magnitude_pred[np.where(np.array(indices)==ii)[0][0]].to(device_zero) for ii in range(len(self.magnitude_pred))],0)
         else:
             self.magnitude_pred = self.magnitude_pred[0]
+            self.logical_class_pred = self.logical_class_pred[0]
         ####
         class_id = logical_class_from_true_err(z2, self.logic_matrix).to(z2.device)
         ####
         loss_ber_reg = 0.0
         loss_ssl = 0.0
-        l = 1.0
         for emb, contrastive_head, ber_head, oned_head in zip(emb_layers,self.contrastive_proj, self.ber_proj, self.oned_final_proj):
-            # z_inter = oned_head(ber_head(emb).squeeze(-1))
+            z_inter = oned_head(ber_head(emb).squeeze(-1))
+            loss_ssl += F.binary_cross_entropy_with_logits(z_inter,logical_flipped(self.logic_matrix.T, z2))
             # loss_ber_reg += F.binary_cross_entropy_with_logits(-z_inter, 1 - z2)
             # emb_proj = F.normalize(contrastive_head(emb).mean(dim=1),dim=-1)
             # loss_ssl += info_nce(emb_proj, class_id)
-            l += 1.0
         loss1 = F.binary_cross_entropy_with_logits(z_pred, 1-z2)
         loss2 = F.binary_cross_entropy_with_logits(self.magnitude_pred, 1-z2)
 
         #lp_logits = ( self.logic_matrix.float() @ z_pred.T ).T         # [B,k] float
-        loss_lp = F.binary_cross_entropy_with_logits(
-            self.lp_head(self.syndrome),  # [B,k] logits
-            (self.logic_matrix.float() @ z2.T).T)
+        # logical_flipped(self.logic_matrix.T, z2)
+        loss_lp = F.binary_cross_entropy_with_logits(self.logical_class_pred, logical_flipped(self.logic_matrix.T, z2))
 
         ###
         self.magnitude_pred = []
-        return loss1,loss2, loss_ssl, loss_ber_reg, loss_lp
+        self.logical_class_pred = []
+        return loss1, loss2, loss_ssl, loss_ber_reg, loss_lp
 
 
     def get_mask(self, code, no_mask=False):

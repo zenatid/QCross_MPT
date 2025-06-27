@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-LOG_PATH = Path(r"C:\Users\DAVIDZEN\DQEC_CrossMPC_logical\Final_Results_QECCT\toric\Code_L_4\noise_model_independent\repetition_1\24_06_2025_16_38_36\logging.txt")
+LOG_PATH = Path(r"C:\Users\DAVIDZEN\DQEC_CrossMPC_logical\Final_Results_QECCT\toric\Code_L_4\noise_model_independent\repetition_1\26_06_2025_23_51_55\logging.txt")
 assert LOG_PATH.exists(), "Log file not found at expected location."
 OUTPUT_DIR = LOG_PATH.parent
 
@@ -48,7 +48,7 @@ epoch_data = {}
 
 # Patterns for batch lines
 batch_pattern = re.compile(
-    r"Training epoch\s+(\d+),\s+Batch\s+(50|100)/100:\s+LR=([0-9eE\+\-\.]+),\s+Loss=([0-9eE\+\-\.]+)\s+BER=([0-9eE\+\-\.]+)\s+LER=([0-9eE\+\-\.]+)"
+    r"Training epoch\s+(\d+),\s+Batch\s+(250|500)/500:\s+LR=([0-9eE\+\-\.]+),\s+Loss=([0-9eE\+\-\.]+)\s+BER=([0-9eE\+\-\.]+)\s+LER=([0-9eE\+\-\.]+)"
 )
 
 # Pattern for detailed loss line following batch line (***Loss=...)
