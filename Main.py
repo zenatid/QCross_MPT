@@ -6,13 +6,20 @@ from __future__ import print_function
 import argparse
 import random
 import os
+
+import numpy as np
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from torch.utils import data
 from datetime import datetime
 import logging
 from Codes import *
 import time
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
+from torch.nn.functional import binary_cross_entropy_with_logits as BCE
+import torch, torch.nn as nn, torch.nn.functional as F, math, copy, logging
+from torch.nn import LayerNorm
+
 import shutil
 ##################################################################
 ##################################################################
@@ -129,21 +136,27 @@ def diff_GF2_mul(H,x):
 
     # assert torch.allclose(logical_flipped(H_bin,x_bin).cpu().detach().bool(), tmp.detach().cpu().bool())
     return tmp
+
+
 ##################################################################
 
 def train(model, device, train_loader, optimizer, epoch, LR):
     model.train()
     cum_loss = cum_ber = cum_ler = cum_samples = 0
-    cum_loss1 = cum_loss2 = cum_loss3 = 0
+    cum_loss1 = cum_loss2 = cum_loss3 = cum_loss_lp= cum_loss_ssl=0
     t = time.time()
     # bin_fun = binarization
     bin_fun = torch.sigmoid
     for batch_idx, (x, z, y, magnitude, syndrome) in enumerate(train_loader):
         syndrome = syndrome.to(device)
-        z_pred = model(magnitude.to(device), syndrome)
-        loss1,loss2 = model.module.loss(-z_pred, z.to(device))
-        loss3 = torch.nn.functional.binary_cross_entropy_with_logits((diff_GF2_mul(train_loader.dataset.logic_matrix,bin_fun(-z_pred))),logical_flipped(train_loader.dataset.logic_matrix, z.to(device)))
-        loss = args.lambda_loss_ber*loss1+args.lambda_loss_n_pred*loss2+args.lambda_loss_ler*loss3
+        z_pred, z_layers_pred, b_L = model(magnitude.to(device), syndrome)
+        loss1,loss2, loss_ssl, loss_ber_reg, loss_lp = model.module.loss(-z_pred, z.to(device), z_layers_pred, b_L)
+        ##########
+        # original
+        #with torch.no_grad():
+        loss3 = BCE((diff_GF2_mul(train_loader.dataset.logic_matrix,bin_fun(-z_pred))),logical_flipped(train_loader.dataset.logic_matrix, z.to(device)))
+        ###########
+        loss = args.lambda_loss_ber * loss1 + args.lambda_loss_n_pred * loss2 + args.lambda_loss_ler * loss3 + args.lambda_loss_lp * loss_lp + args.lambda_loss_ssl * loss_ssl
         model.zero_grad()
         loss.backward()
         optimizer.step()
@@ -157,6 +170,8 @@ def train(model, device, train_loader, optimizer, epoch, LR):
         cum_loss1 += loss1.item() * z.shape[0]
         cum_loss2 += loss2.item() * z.shape[0]
         cum_loss3 += loss3.item() * z.shape[0]
+        cum_loss_lp += loss_lp.item() * z.shape[0]
+        cum_loss_ssl += loss_ssl.item() * z.shape[0]
         #
         cum_ber += ber * z.shape[0]
         cum_ler += ler * z.shape[0]
@@ -166,7 +181,7 @@ def train(model, device, train_loader, optimizer, epoch, LR):
             logging.info(
                 f'Training epoch {epoch}, Batch {batch_idx + 1}/{len(train_loader)}: LR={LR:.2e}, Loss={cum_loss / cum_samples:.5e} BER={cum_ber / cum_samples:.3e} LER={cum_ler / cum_samples:.3e}')
             logging.info(
-                f'***Loss={cum_loss / cum_samples:.5e} Loss LER={cum_loss3 / cum_samples:.5e} Loss BER={cum_loss1 / cum_samples:.5e} Loss noise pred={cum_loss2 / cum_samples:.5e}')
+                f'***Loss={cum_loss / cum_samples:.5e} Loss LER={cum_loss3 / cum_samples:.5e} Loss BER={cum_loss1 / cum_samples:.5e} Loss noise pred={cum_loss2 / cum_samples:.5e} Loss LP={cum_loss_lp / cum_samples:.5e} Loss ssl ={cum_loss_ssl / cum_samples:.5e}')
     logging.info(f'Epoch {epoch} Train Time {time.time() - t}s\n')
     return cum_loss / cum_samples, cum_ber / cum_samples, cum_ler / cum_samples
 
@@ -182,8 +197,8 @@ def test(model, device, test_loader_list, ps_range_test, cum_count_lim=100000):
             test_ber = test_ler = cum_count = 0.
             while True:
                 (x, z, y, magnitude, syndrome) = next(iter(test_loader))
-                z_pred = model(magnitude.to(device), syndrome.to(device))
-                _ = model.module.loss(-z_pred, z.to(device))
+                z_pred,z_layers_pred, b_L = model(magnitude.to(device), syndrome.to(device))
+                _ = model.module.loss(-z_pred, z.to(device), z_layers_pred, b_L)
                 z_pred = sign_to_bin(torch.sign(-z_pred))
 
                 test_ber += BER(z_pred, z.to(device)) * z.shape[0]
@@ -222,19 +237,20 @@ def main(args):
     if args.repetitions > 1:
         from Model_T_measurements import ECC_Transformer
     else:
-        from Model import ECC_Transformer
+        from Model_QCrossMPC_multiLoss import ECC_Transformer
 
     #################################
     model = ECC_Transformer(args, dropout=0).to(device)
     model = torch.nn.DataParallel(model)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    #scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=args.epochs//50, eta_min=1e-6)
     
     logging.info(f'PC matrix shape {code.pc_matrix.shape}')
     logging.info(model)
     logging.info(f'# of Parameters: {np.sum([np.prod(p.shape) for p in model.parameters()])}')
     #################################
-    ps_test = np.linspace(0.01, 0.2, 9)
+    ps_test = np.linspace(0.01, 0.1, 9) #fix to 0.2 instead on 0.1
     if args.noise_type == 'depolarization':
         ps_test = np.linspace(0.05, 0.2, 9)
     if args.repetitions > 1:
@@ -242,7 +258,7 @@ def main(args):
     ###
     ps_train = ps_test
 
-    train_dataloader = DataLoader(QECC_Dataset(code, ps_train, len=args.batch_size * 5000, args=args), batch_size=int(args.batch_size),
+    train_dataloader = DataLoader(QECC_Dataset(code, ps_train, len=args.batch_size * args.batch_num, args=args), batch_size=int(args.batch_size),
                                   shuffle=True, num_workers=args.workers)
     test_dataloader_list = [DataLoader(QECC_Dataset(code, [ps_test[ii]], len=int(args.test_batch_size),args=args),
                                        batch_size=int(args.test_batch_size), shuffle=False, num_workers=args.workers) for ii in range(len(ps_test))]
@@ -260,7 +276,11 @@ def main(args):
         if epoch % 60 == 0 or epoch in [1, args.epochs]:
             test(model, device, test_dataloader_list, ps_test)
     ###
-    model = torch.load(os.path.join(args.path, 'best_model')).to(device)
+    #model = torch.load(os.path.join(args.path, 'best_model')).to(device)
+    model = torch.load(
+        os.path.join(args.path, 'best_model'),
+        weights_only=False  # revert to the ≤2.5 default
+    ).to(device)
     logging.info('Best model loaded')
     ps_test = np.linspace(0.01, 0.2, 18)
     if args.noise_type == 'depolarization':
@@ -278,28 +298,33 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch DQEC')
     parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--workers', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--workers', type=int, default=0)
+    parser.add_argument('--lr', type=float, default=4e-4)
     parser.add_argument('--gpus', type=str, default='0', help='gpus ids')
     parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_num', type=int, default=100)
     parser.add_argument('--test_batch_size', type=int, default=512)
+    parser.add_argument('--weight_decay', type=float, default=5e-6)
     parser.add_argument('--seed', type=int, default=42)
 
     # Code args
-    parser.add_argument('--code_type', type=str, default='toric',choices=['toric'])
+    parser.add_argument('--code_type', type=str, default='toric',choices=['toric', 'rotated_surface'])
     parser.add_argument('--code_L', type=int, default=4,help='Lattice length')
     parser.add_argument('--repetitions', type=int, default=1,help='Number of faulty repetitions. <=1 is equivalent to none.')
     parser.add_argument('--noise_type', type=str,default='independent', choices=['independent','depolarization'],help='Noise model')
 
     # model args
     parser.add_argument('--N_dec', type=int, default=6,help='Number of QECCT self-attention modules')
-    parser.add_argument('--d_model', type=int, default=128,help='QECCT dimension')
+    parser.add_argument('--d_model', type=int, default=128,help='QECCT dimension') #orig: 32
     parser.add_argument('--h', type=int, default=16,help='Number of heads')
 
     # qecc args
     parser.add_argument('--lambda_loss_ber', type=float, default=0.5,help='BER loss regularization')
-    parser.add_argument('--lambda_loss_ler', type=float, default=1.,help='LER loss regularization')
-    parser.add_argument('--lambda_loss_n_pred', type=float, default=0.5,help='g noise prediction regularization')
+    parser.add_argument('--lambda_loss_ler', type=float, default=1.0,help='LER loss regularization')
+    parser.add_argument('--lambda_loss_n_pred', type=float, default=0.3,help='g noise prediction regularization')
+    parser.add_argument('--lambda_loss_lp', type=float, default=0.3, help='lp loss regularization')
+    parser.add_argument('--lambda_loss_ssl', type=float, default=0.1,help='InfoNCE loss regularization')
+    parser.add_argument('--lambda_loss_ber_reg', type=float, default=0.01, help='BER multi-layer loss regularization')
     
     # ablation args
     parser.add_argument('--no_g', type=int, default=0)
@@ -313,14 +338,15 @@ if __name__ == '__main__':
     if args.no_g > 0:
         args.lambda_loss_n_pred= 0.
     ###
-    class Code():
-        pass
+    # class Code():
+    #     pass
     code = Code()
     H,Lx = eval(f'Get_{args.code_type}_Code')(args.code_L,full_H=args.noise_type == 'depolarization')
     code.logic_matrix = torch.from_numpy(Lx).long()
     code.pc_matrix = torch.from_numpy(H).long()
     code.n = code.pc_matrix.shape[1]
-    code.k = code.n - code.pc_matrix.shape[0]
+    code.m = code.pc_matrix.shape[0]
+    code.k = code.logic_matrix.shape[0]
     code.code_type = args.code_type
     args.code = code
     ####################################################################
