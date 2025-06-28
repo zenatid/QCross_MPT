@@ -228,13 +228,22 @@ class ECC_Transformer(nn.Module):
         self.magnitude_pred = []
         self.logical_class_pred = []
 
-    @torch.no_grad()
-    def _logical_parity(self, synd: torch.Tensor) -> torch.Tensor:
+    # @torch.no_grad()
+    # def _logical_parity(self, synd: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     Predict   \hat b_L  from syndrome.  Returns hard 0/1 bits  [B,k].
+    #     """
+    #     logits = self.lp_head(synd)            # [B,k]
+    #     return (logits.sigmoid() > 0.5).float()
+    # [B,k]
+    def _logical_parity(self, synd: torch.Tensor, hard: bool = False) -> torch.Tensor:
         """
-        Predict   \hat b_L  from syndrome.  Returns hard 0/1 bits  [B,k].
+        Return probabilities in training; hard 0/1 only in eval.
         """
-        logits = self.lp_head(synd)            # [B,k]
-        return (logits.sigmoid() > 0.5).float()                                  # [B,k]
+        logits = self.lp_head(synd)  # [B,k]
+        if hard and (not self.training):
+            return (logits.sigmoid() > 0.5).float()
+        return logits.sigmoid()  # probabilities ∈ (0,1)
 
     def forward(self, magnitude, syndrome):
         """magnitude: dummy placeholder (ignored); syndrome: [B,m]."""
@@ -242,6 +251,8 @@ class ECC_Transformer(nn.Module):
         # (0) Predict qubit reliabilities (syn_to_noise)
         magnitude = self.syn_to_noise(syndrome) # [B,n] logits
         logical_class = self._logical_parity(syndrome)  # [B,k] logits
+
+
         if self.no_g: # ablation flag
             magnitude = magnitude*0+1
             logical_class = logical_class*0+1
@@ -252,9 +263,9 @@ class ECC_Transformer(nn.Module):
         VN = self.src_embed_VN.unsqueeze(0) * magnitude.unsqueeze(-1)  # [B,n,d]
         CN = self.src_embed_CN.unsqueeze(0) * syndrome.unsqueeze(-1)  # [B,m,d]
 
-        logical_class = self._logical_parity(syndrome)  # [B,k]
+        #logical_class = self._logical_parity(syndrome)  # [B,k]
         LN = self.src_embed_LP.unsqueeze(0) * logical_class.unsqueeze(-1)  # [B,k,d]
-
+        self.LN = LN
         # (2) Cross-message passing
         emb_VN, emb_CN, emb_LN, inter = self.decoder(VN, CN, LN, self.src_mask_VN, self.src_mask_CN, self.src_mask_LN)
         # 1. after you have the node-embeddings-concatenate on node axis
@@ -292,9 +303,10 @@ class ECC_Transformer(nn.Module):
         loss1 = F.binary_cross_entropy_with_logits(z_pred, 1-z2)
         loss2 = F.binary_cross_entropy_with_logits(self.magnitude_pred, 1-z2)
 
-        #lp_logits = ( self.logic_matrix.float() @ z_pred.T ).T         # [B,k] float
-        # logical_flipped(self.logic_matrix.T, z2)
         loss_lp = F.binary_cross_entropy_with_logits(self.logical_class_pred, logical_flipped(self.logic_matrix.T, z2))
+        #loss_lp = info_nce(self.logical_class_pred, class_id)
+        #loss_lp = info_nce(F.normalize(self.LN.mean(dim=1),dim=-1), class_id)
+        #loss_lp *= 0.0
 
         ###
         self.magnitude_pred = []

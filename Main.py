@@ -302,9 +302,9 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=4e-4)
     parser.add_argument('--gpus', type=str, default='0', help='gpus ids')
     parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--batch_num', type=int, default=500)
+    parser.add_argument('--batch_num', type=int, default=100)
     parser.add_argument('--test_batch_size', type=int, default=512)
-    parser.add_argument('--weight_decay', type=float, default=5e-4)
+    parser.add_argument('--weight_decay', type=float, default=5e-6)
     parser.add_argument('--seed', type=int, default=42)
 
     # Code args
